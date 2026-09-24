@@ -50,8 +50,9 @@ jobs:
           # 1) 官方+定制译文写回源码（输出到 _src_zh，原始 src 保持不动）
           python localization/apply.py upstream/src _src_zh
 
-          # 2) 注入简体中文字形范围，否则中文会显示成空白方框
-          python localization/patch_font.py _src_zh/game/frontend/Menu.cpp
+          # 2) 注入简体中文字形范围（扫描 _src_zh 全部字符串字面量，
+          #    动态收集实际用到的字符，含 imgui 内置 2500 字表缺的"辑剪贴"等）
+          python localization/patch_font.py _src_zh
 
           # 3) 用汉化后的源码替换构建目录
           Remove-Item -Recurse -Force upstream/src

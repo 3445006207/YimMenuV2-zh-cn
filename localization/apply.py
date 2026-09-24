@@ -166,10 +166,42 @@ def load_tmap():
     return tmap
 
 
+def patch_cmake_utf8(src_root):
+    """给上游 CMakeLists.txt 追加 MSVC /utf-8。
+
+    根因：源码含 UTF-8 中文字面量且无 BOM，MSVC 默认按系统代码页
+    (windows-latest 上为 CP1252) 解释，转换失败的字符在编译期就被
+    替换成 '?'，DLL 里的字符串直接损坏。/utf-8 强制源码与执行字符集
+    均为 UTF-8。clang-cl 默认按 UTF-8 处理，且其 CXX_COMPILER_ID 是
+    "Clang"，下面的 generator expression 不会影响 clang 构建。
+    """
+    root = os.path.dirname(os.path.abspath(src_root.rstrip('/\\')))
+    cm = os.path.join(root, 'CMakeLists.txt')
+    if not os.path.exists(cm):
+        print('  cmake utf-8   : CMakeLists.txt not found next to src, skipped')
+        return
+    text = open(cm, encoding='utf-8').read()
+    if 'zh-CN localization: MSVC utf-8' in text:
+        print('  cmake utf-8   : already applied, skipped')
+        return
+    text += ('\n# --- BEGIN zh-CN localization: MSVC utf-8 ---\n'
+             '# Sources contain UTF-8 Chinese literals; without /utf-8 MSVC interprets\n'
+             '# them via the system codepage and some characters become "?" in the binary.\n'
+             'target_compile_options(${PROJECT_NAME} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)\n'
+             '# --- END zh-CN localization: MSVC utf-8 ---\n')
+    open(cm, 'w', encoding='utf-8', newline='').write(text)
+    print('  cmake utf-8   : applied (%s)' % cm)
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     src_root, out_root = sys.argv[1], sys.argv[2]
+
+    # MSVC 编码链修复：源码含无 BOM 的 UTF-8 中文，MSVC 默认按系统代码页
+    # (CP1252) 解释会把部分字符编译成 '?'。必须在 copytree 之前打，
+    # 因为它改的是 src_root 上一级的 CMakeLists.txt（upstream/CMakeLists.txt）。
+    patch_cmake_utf8(src_root)
 
     tmap = load_tmap()
     # 长键优先，避免短键先命中造成半截替换
