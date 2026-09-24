@@ -55,7 +55,7 @@ jobs:
 
           # 3) 用汉化后的源码替换构建目录
           Remove-Item -Recurse -Force upstream/src
-          Rename-Item _src_zh upstream/src
+          Move-Item _src_zh upstream/src
 
       - name: Setup MSVC
         if: matrix.toolset == 'msvc'
