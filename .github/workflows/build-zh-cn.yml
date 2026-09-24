@@ -34,7 +34,7 @@ jobs:
       BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
 
     steps:
-      - name: Checkout (this repo: localization files)
+      - name: Checkout (localization files)
         uses: actions/checkout@v4
 
       - name: Checkout upstream source
