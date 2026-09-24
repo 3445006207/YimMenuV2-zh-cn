@@ -1,0 +1,121 @@
+name: Build YimMenuV2 (zh-CN)
+
+# 构建「注入即中文」的 YimMenuV2.dll：
+#   1. 本仓库只保存汉化脚本与定制词典（translations_part_*.json），
+#      源码与官方译文在构建时自动拉取（commit 已固定，可复现）
+#   2. apply.py 合并官方+定制译文写回源码，patch_font.py 注入简体中文字形，再重新编译
+#   3. push 到 main 自动触发；也可在 Actions 页手动 Run workflow（默认 Release）
+#   4. msvc 产物同时发布到 Release（附件 YimMenuV2.dll），两套工具链产物都在 Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: false
+        default: 'Release'
+        type: choice
+        options: [Release, RelWithDebInfo]
+  push:
+    branches: [zh-cn, zh_cn, main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolset: [msvc, clang]
+
+    env:
+      BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+
+    steps:
+      - name: Checkout (this repo: localization files)
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: YimMenu/YimMenuV2
+          ref: enhanced
+          path: upstream
+
+      - name: Apply Chinese localization to sources
+        shell: pwsh
+        run: |
+          # 1) 官方+定制译文写回源码（输出到 _src_zh，原始 src 保持不动）
+          python localization/apply.py upstream/src _src_zh
+
+          # 2) 注入简体中文字形范围，否则中文会显示成空白方框
+          python localization/patch_font.py _src_zh/game/frontend/Menu.cpp
+
+          # 3) 用汉化后的源码替换构建目录
+          Remove-Item -Recurse -Force upstream/src
+          Rename-Item _src_zh upstream/src
+
+      - name: Setup MSVC
+        if: matrix.toolset == 'msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: Configure (MSVC)
+        if: matrix.toolset == 'msvc'
+        shell: pwsh
+        run: |
+          cmake -S upstream -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl
+
+      - name: Configure (Clang)
+        if: matrix.toolset == 'clang'
+        shell: pwsh
+        run: |
+          cmake -S upstream -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_TYPE --parallel
+
+      - name: Locate DLL
+        id: find
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build -Recurse -Filter 'YimMenuV2.dll' |
+                 Select-Object -First 1
+          if (-not $dll) { throw 'YimMenuV2.dll not found under build/' }
+          "path=$($dll.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Found: $($dll.FullName)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: YimMenuV2-zh-CN-${{ matrix.toolset }}
+          path: ${{ steps.find.outputs.path }}
+          if-no-files-found: error
+
+      - name: Publish to Release (msvc only)
+        if: matrix.toolset == 'msvc'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "zh-cn-$env:GITHUB_RUN_NUMBER"
+          $dll = "${{ steps.find.outputs.path }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag "$dll" `
+              --title "YimMenuV2 简体中文版 #$env:GITHUB_RUN_NUMBER" `
+              --notes "自动构建：注入即中文的 YimMenuV2.dll（msvc / $env:BUILD_TYPE）。下载附件 YimMenuV2.dll 即可使用。"
+          } else {
+            gh release upload $tag "$dll" --clobber
+          }
