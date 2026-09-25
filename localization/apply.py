@@ -82,7 +82,7 @@ COMPILED = [(name, re.compile(rx), mode) for name, rx, mode in PATTERNS]
 #     3. core/scripting 等非 UI 目录整体不参与（避免误伤 Lua API 名）。
 # 该步骤在 PATTERNS 之后执行：已被 pattern 翻译过的字面量此时是中文，
 # 不会二次命中；且幂等。
-UI_DIRS = ('game/frontend/', 'game/features/', 'game/backend/', 'game/gta/data/')
+UI_DIRS = ('game/frontend/', 'game/features/', 'game/backend/', 'game/gta/data/', 'core/frontend/')
 
 LOWER_IDENT = re.compile(r'[a-z][a-z0-9_]*$')
 BYTE_PAT = re.compile(r'[0-9A-F?]{1,2}(?: [0-9A-F?]{1,2})*$')
@@ -308,6 +308,185 @@ def patch_cmake_utf8(src_root):
     print('  cmake utf-8   : applied (%s)' % cm)
 
 
+# ------------------------------------------------- 赛博霓虹主题注入 ----------
+# 上游 YimMenuV2 内置 4 套界面风格（Classic / Modern / ModernVertical /
+# Modular），主题渲染函数集中在 core/frontend/manager/styles/ 下，源码注释
+# 明确写了 "append when adding new themes"。因此新增第 5 套主题只需：
+#   1. 放置 styles/Neon/{Neon.hpp,Neon.cpp}
+#   2. UIManager.hpp 的 UITheme 枚举追加取值
+#   3. UIManager.cpp 的 g_StyleOptions 追加选项 + DrawImpl() switch 追加 case
+#   4. styles/Themes.hpp 追加前向声明
+#   5. 改默认配色（Themes.cpp::DefaultStyle）并加配色修订号，避免老
+#      themes.json 把颜色拉回旧色系
+# 全部改写都是「幂等字符串替换」：上游文件若已包含改动就直接跳过，
+# 不整文件覆盖，以免压掉上游后续更新。
+
+THEME_DIR_NAME = 'Neon'
+THEME_DISPLAY_ZH = '赛博霓虹'
+THEME_REVISION = 4
+
+
+def _rewrite(path, replacements, label):
+    """按 (old, new, sentinel) 或 (old, new) 列表做幂等替换。返回实际替换条数。
+
+    sentinel 是 new 中独有的标记文本：若已存在于文件里，说明改过，跳过。
+    不传 sentinel 时退化为「new 在且 old 不在则跳过」的判断。
+    同一文件内的多次替换各自独立判定。
+    """
+    if not os.path.exists(path):
+        print('  theme %-14s: %s not found, skipped' % (label, os.path.basename(path)))
+        return 0
+    text = open(path, encoding='utf-8').read()
+    done = 0
+    for item in replacements:
+        old, new = item[0], item[1]
+        sentinel = item[2] if len(item) > 2 else new
+        if sentinel in text:
+            continue  # 已改过
+        if old in text:
+            text = text.replace(old, new, 1)
+            done += 1
+        else:
+            print('  theme %-14s: pattern not found in %s' % (label, os.path.basename(path)))
+    open(path, 'w', encoding='utf-8', newline='').write(text)
+    print('  theme %-14s: %d replacement(s)' % (label, done))
+    return done
+
+
+def install_neon_theme(out_root):
+    """安装「赛博霓虹」主题并切换为默认风格（幂等）。"""
+    styles = os.path.join(out_root, 'core', 'frontend', 'manager', 'styles')
+    neon_dir = os.path.join(styles, THEME_DIR_NAME)
+
+    # 主题源码与 apply.py 同级（仓库里是 localization/theme/）。
+    # 同时兼容「apply.py 在仓库根」与「在 localization/ 下」两种布局。
+    here = None
+    for cand in (os.path.join(HERE, 'theme'), os.path.join(HERE, 'localization', 'theme')):
+        if os.path.isdir(cand):
+            here = cand
+            break
+
+    # 1) 主题渲染文件（CMake 走 GLOB_RECURSE，放进 src 树即自动参与编译）
+    if here:
+        os.makedirs(neon_dir, exist_ok=True)
+        for name in (THEME_DIR_NAME + '.hpp', THEME_DIR_NAME + '.cpp'):
+            s = os.path.join(here, name)
+            if os.path.exists(s):
+                shutil.copyfile(s, os.path.join(neon_dir, name))
+        print('  theme files   : installed -> styles/%s/ (from %s)' % (THEME_DIR_NAME, os.path.basename(here)))
+    else:
+        print('  theme files   : theme/ not found next to apply.py, theme not installed')
+        return
+
+    # 2) UIManager.hpp —— 枚举追加载值
+    _rewrite(os.path.join(out_root, 'core', 'frontend', 'manager', 'UIManager.hpp'),
+             [('\t\tModular,\n\t};',
+               '\t\tModular,\n\t\t%s,\n\t};' % THEME_DIR_NAME)],
+             'UIManager.hpp')
+
+    # 3) UIManager.cpp —— 选项表、默认值、switch 分支
+    _rewrite(os.path.join(out_root, 'core', 'frontend', 'manager', 'UIManager.cpp'),
+             [('\t    {3, "Modern (Modular)"},\n\t};',
+               '\t    {3, "Modern (Modular)"},\n\t    {4, "%s"},\n\t};' % THEME_DISPLAY_ZH),
+              ('\t\t"Choose the UI style",\n\t\tg_StyleOptions,\n\t\t0};',
+               '\t\t"Choose the UI style",\n\t\tg_StyleOptions,\n\t\t4};'),
+              ('\t\tdefault:\n\t\t\tRenderClassicTheme(); // Default theme',
+               '\t\tcase UITheme::%s:\n\t\t\tRender%sTheme();\n\t\t\tbreak;\n'
+               '\t\tdefault:\n\t\t\tRender%sTheme(); // Default theme'
+               % (THEME_DIR_NAME, THEME_DIR_NAME, THEME_DIR_NAME))],
+             'UIManager.cpp')
+
+    # 4) styles/Themes.hpp —— 前向声明 + 配色修订号
+    _rewrite(os.path.join(styles, 'Themes.hpp'),
+             [('\textern void RenderModularTheme();\n\textern void SetupStyle();',
+               '\textern void RenderModularTheme();\n'
+               '\textern void Render%sTheme();\n\textern void SetupStyle();' % THEME_DIR_NAME),
+              ('\textern void SetupStyle();\n\textern void DefaultStyle();\n}',
+               '\textern void SetupStyle();\n\textern void DefaultStyle();\n\n'
+               '\t// 配色修订号：修改 DefaultStyle() 的配色后递增，用于让已存在的\n'
+               '\t// themes.json 自动升级到新配色（见 ApplyDefaultThemeIfOutdated）。\n'
+               '\tinline constexpr int kThemeRevision = %d;\n'
+               '\tinline constexpr const char* kThemeRevisionKey = "_ThemeRevision";\n\n'
+               '\t// 当 themes.json 由旧版配色写出时，用当前 DefaultStyle() 的霓虹配色覆盖它。\n'
+               '\t// 返回 true 表示实际执行了升级。\n'
+               '\textern bool ApplyDefaultThemeIfOutdated();\n}' % THEME_REVISION)],
+             'Themes.hpp')
+
+    # 5) styles/Themes.cpp —— 换掉默认配色（霓虹）+ 调用配色升级
+    #    整段替换 DefaultStyle() 函数体：从函数头到 SetupStyle() 之前，
+    #    避免逐条改 40 多个颜色值（易漏且难维护）。
+    themes_cpp = os.path.join(styles, 'Themes.cpp')
+    inc = os.path.join(here, 'DefaultStyle.cpp.inc') if here else None
+    if inc and os.path.exists(inc):
+        text = open(themes_cpp, encoding='utf-8').read()
+        if 'ImGuiCol_CheckMark] = ImVec4(0.00f, 0.90f, 1.00f' in text:
+            print('  theme %-14s: 0 replacement(s) (already neon)' % 'Themes.cpp')
+        else:
+            i = text.find('void DefaultStyle()')
+            j = text.find('void SetupStyle()', i + 1)
+            if i >= 0 and j > i:
+                new_body = open(inc, encoding='utf-8', newline='').read()
+                text = text[:i] + new_body + text[j:]
+                print('  theme %-14s: 1 replacement(s) (neon palette)' % 'Themes.cpp')
+            else:
+                print('  theme %-14s: DefaultStyle()/SetupStyle() not found!' % 'Themes.cpp')
+        open(themes_cpp, 'w', encoding='utf-8', newline='').write(text)
+    else:
+        print('  theme %-14s: DefaultStyle.cpp.inc missing, palette unchanged' % 'Themes.cpp')
+
+    _rewrite(themes_cpp,
+             [('\t\t// Apply loaded colors/rounding to ImGui\n\t\tApplyThemeToImGui();',
+               '\t\t// If the saved settings were written by an older theme revision, refresh\n'
+               '\t\t// them with the new palette so existing installs pick up the Neon colors too.\n'
+               '\t\tApplyDefaultThemeIfOutdated();\n\n'
+               '\t\t// Apply loaded colors/rounding to ImGui\n\t\tApplyThemeToImGui();',
+               '\t\tApplyDefaultThemeIfOutdated();')],
+             'Themes.cpp')
+
+    # 6) GUISettings.cpp —— 实现配色升级（含修订号落盘）
+    _apply_impl = (
+        '\n\tbool ApplyDefaultThemeIfOutdated()\n'
+        '\t{\n'
+        '\t\tint savedRevision = -1;\n'
+        '\t\tif (std::filesystem::exists(kSettingsFile))\n'
+        '\t\t{\n'
+        '\t\t\tstd::ifstream file(kSettingsFile);\n'
+        '\t\t\tnlohmann::json json;\n'
+        '\t\t\tfile >> json;\n'
+        '\t\t\tif (auto it = json.find(kThemeRevisionKey); it != json.end() && it->is_number())\n'
+        '\t\t\t\tsavedRevision = it->get<int>();\n'
+        '\t\t}\n\n'
+        '\t\tif (savedRevision == kThemeRevision)\n'
+        '\t\t\treturn false; // already on the current palette, keep user tweaks\n\n'
+        '\t\t// Adopt the palette currently sitting in ImGuiStyle (just filled by DefaultStyle()).\n'
+        '\t\tauto& style = ImGui::GetStyle();\n'
+        '\t\tfor (int i = 0; i < ImGuiCol_COUNT; ++i)\n'
+        '\t\t\tg_ColorCommands[i]->SetState(style.Colors[i]);\n\n'
+        '\t\tg_RoundingValues["WindowRounding"] = style.WindowRounding;\n'
+        '\t\tg_RoundingValues["FrameRounding"] = style.FrameRounding;\n'
+        '\t\tg_RoundingValues["GrabRounding"] = style.GrabRounding;\n'
+        '\t\tg_RoundingValues["ScrollbarRounding"] = style.ScrollbarRounding;\n'
+        '\t\tg_RoundingValues["ChildRounding"] = style.ChildRounding;\n'
+        '\t\tg_RoundingValues["PopupRounding"] = style.PopupRounding;\n'
+        '\t\tg_RoundingValues["TabRounding"] = style.TabRounding;\n\n'
+        '\t\tSyncColorCommandsToStyle();\n'
+        '\t\tSyncRoundingToStyle();\n'
+        '\t\tSaveSettings();\n'
+        '\t\treturn true;\n'
+        '\t}\n\n'
+    )
+    _rewrite(os.path.join(out_root, 'game', 'frontend', 'submenus', 'Settings', 'GUISettings.cpp'),
+             [('\t\t// Save floats\n\t\tfor (auto& [k, cmd] : g_FloatCommands)\n\t\t\tjson[k] = cmd->GetState();\n',
+               '\t\t// Save floats\n\t\tfor (auto& [k, cmd] : g_FloatCommands)\n\t\t\tjson[k] = cmd->GetState();\n\n'
+               '\t\t// Stamp the palette revision so future builds can detect stale configs\n'
+               '\t\tjson[kThemeRevisionKey] = kThemeRevision;\n',
+               'json[kThemeRevisionKey] = kThemeRevision;'),
+              ('\tvoid ApplyThemeToImGui()',
+               _apply_impl + '\tvoid ApplyThemeToImGui()',
+               'bool ApplyDefaultThemeIfOutdated()')],
+             'GUISettings.cpp')
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -326,6 +505,10 @@ def main():
     if os.path.exists(out_root):
         shutil.rmtree(out_root)
     shutil.copytree(src_root, out_root)
+
+    # 先进主题（新增文件 + 注册点改写），再走汉化，
+    # 这样主题里新增的英文 UI 字面量同样会被词典覆盖。
+    install_neon_theme(out_root)
 
     scanned = patched = 0
     for dp, dn, fn in os.walk(out_root):
