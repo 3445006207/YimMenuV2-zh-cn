@@ -58,6 +58,8 @@ PATTERNS = [
     ('group', r'(std::make_shared<\s*(?:Category|Group)\s*>\s*\(\s*)' + LIT, 'all'),
     # 输入提示（标签与提示都可见）
     ('hint', r'(InputTextWithHint\s*\(\s*)' + LIT + r'(\s*,\s*)' + LIT, 'all'),
+    # 桌面通知：Notifications::Show("标题", "内容", 类型) —— 两条都是 UI 文本
+    ('notify', r'(Notifications::Show\s*\(\s*)' + LIT + r'(\s*,\s*)' + LIT, 'all'),
     # 下拉/列表选项表：{<int|enum>, "标签"}
     ('optionlist', r'(\{\s*[^,\{\}\[\]]{1,140},\s*)' + LIT + r'(\s*\})', 'second'),
     # 普通 ImGui::Text
@@ -67,6 +69,117 @@ for _w in WIDGETS:
     PATTERNS.append(('widget', r'(' + _w.replace('.', r'\.') + r'\s*\(\s*)' + LIT, 'all'))
 
 COMPILED = [(name, re.compile(rx), mode) for name, rx, mode in PATTERNS]
+
+# ------------------------------------------------- 兜底直译（UI 目录白名单）---
+# 背景：YimMenuV2 的界面由一套多态 Item 类 + 大量数据表构建
+#   （make_shared<CommandItem>("id"_J, "标签")、CollapsingHeaderItem("标题")、
+#    {"Sedan", "Coupe", ...} 之类的字符串数组…），
+# 调用点写法五花八门，逐个枚举 pattern 既易漏又难维护。
+# 因此对 UI 目录采用「词典精确命中即替换」策略：
+#   安全性由三点保证 ——
+#     1. 只有显式收录进词典的字符串才会被替换（词典即白名单）；
+#     2. 形状过滤排除内部名/资产键/字节特征码/格式串/路径/隐藏 ID；
+#     3. core/scripting 等非 UI 目录整体不参与（避免误伤 Lua API 名）。
+# 该步骤在 PATTERNS 之后执行：已被 pattern 翻译过的字面量此时是中文，
+# 不会二次命中；且幂等。
+UI_DIRS = ('game/frontend/', 'game/features/', 'game/backend/', 'game/gta/data/')
+
+LOWER_IDENT = re.compile(r'[a-z][a-z0-9_]*$')
+BYTE_PAT = re.compile(r'[0-9A-F?]{1,2}(?: [0-9A-F?]{1,2})*$')
+FILENAME = re.compile(r'\.[A-Za-z0-9]{1,6}$')          # arial.ttf / meiryo.ttc …
+# 路径构造上下文：这些位置的字面量是文件/目录名，绝不能翻译
+# （血的教训：早期词表把 "Fonts" 译成"字体"，会让 %SYSTEMROOT%/Fonts 失效，
+#   字体加载失败 → 所有中文变方块）
+PATH_CTX = re.compile(r'std::filesystem::path|getenv\s*\(|/ "|" /')
+
+
+def is_ui_literal(inner):
+    """形状过滤：只把"像 UI 文本"的字面量交给词典判断。"""
+    if not inner.strip() or len(inner) > 110:
+        return False
+    if GAME_ASSET_KEY.match(inner):
+        return False
+    if LOWER_IDENT.match(inner):        # 全小写内部名/标识符/音效名
+        return False
+    if BYTE_PAT.match(inner):           # "2D 01 09 00 00" 字节特征码
+        return False
+    if FILENAME.search(inner):          # 文件名（arial.ttf、config.json…）
+        return False
+    if re.search(r'[%\\/]|\{[^}]*\}', inner):   # 格式串、路径
+        return False
+    if not re.search(r'[A-Za-z]', inner):
+        return False
+    return True
+
+
+def iter_string_literals(text):
+    """扫描 C/C++ 字符串字面量，产出 (start, end, inner)（end 为闭引号后一位）。
+
+    ⚠ 不能用 '"..."' 这类正则：在 `("hash"_J, "Label")` 这种相邻字面量上，
+    正则会把第一个串的**闭引号**当成下一个串的开引号，错配引号对，
+    导致真正的标签字面量被整段跳过（这正是 "Amount"/"Session Type"/"Kill All"
+    等标签长期翻不出来的原因）。这里用状态机逐字符扫描，转义与相邻串都正确。
+    """
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != '"':
+            i += 1
+            continue
+        j = i + 1
+        while j < n:
+            c = text[j]
+            if c == '\\':
+                j += 2
+                continue
+            if c == '"' or c == '\n':
+                break
+            j += 1
+        if j < n and text[j] == '"':
+            yield i, j + 1, text[i + 1:j]
+            i = j + 1
+        else:
+            i += 1          # 未闭合（例如跨行截断），跳过这个引号
+
+
+def translate_ui_literals(text, tmap, stats, overrides=None):
+    parts, last = [], 0
+    for start, end, inner in iter_string_literals(text):
+        if start < last:
+            continue
+        lit = text[start:end]
+        if text[end:end + 2] == '_J':          # joaat 内部名，不能翻译
+            continue
+        if overrides and inner in overrides:   # 同字不同义的文件级精确覆盖
+            zh = overrides[inner]
+        else:
+            window = text[max(0, start - 90):end + 90]
+            if PATH_CTX.search(window):        # 路径构造表达式里的字符串
+                continue
+            if not is_ui_literal(inner):
+                continue
+            zh = tmap.get(inner)
+            if zh:
+                hidden = HIDDEN_ID.match(inner)
+                if hidden:
+                    zh = zh + hidden.group(2)  # 保留 ImGui 隐藏 ID
+            else:
+                continue
+        if not zh or zh == inner:
+            continue
+        parts.append(text[last:start])
+        parts.append('"' + esc(zh) + '"')
+        last = end
+        stats['ui'] += 1
+    parts.append(text[last:])
+    return ''.join(parts)
+
+
+# 同字不同义的精确覆盖（按文件路径后缀匹配，优先级最高）。
+# 例：Weather.cpp 的 "Clear" 是天气（晴朗），调试页按钮的 "Clear" 是"清除"，
+# 全局词表只能二选一，这里按文件单独修正。
+FILE_OVERRIDES = {
+    'features/world/Weather.cpp': {'Clear': '晴朗'},
+}
 
 # 游戏资产标签键：交给游戏引擎本地化，翻译后反而取不到文本。
 GAME_ASSET_KEY = re.compile(r'^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$')
@@ -162,7 +275,9 @@ def load_tmap():
         json.dump(official, open(cache, 'w', encoding='utf-8'), ensure_ascii=False)
     tmap = dict(official)
     for f in sorted(glob.glob(os.path.join(HERE, 'translations_part_*.json'))):
-        tmap.update(json.load(open(f, encoding='utf-8')))
+        data = json.load(open(f, encoding='utf-8'))
+        # 只接受 str -> str：词典文件里若混入注释对象/嵌套结构，直接忽略，避免脏数据进词表
+        tmap.update({k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)})
     return tmap
 
 
@@ -227,6 +342,10 @@ def main():
             except UnicodeDecodeError:
                 continue
             new = patch_text(text, tmap, stats)
+            rel = os.path.relpath(p, out_root).replace('\\', '/')
+            if rel.startswith(UI_DIRS):
+                ovr = next((t for suffix, t in FILE_OVERRIDES.items() if rel.endswith(suffix)), None)
+                new = translate_ui_literals(new, tmap, stats, ovr)
             if new != text:
                 open(p, 'w', encoding='utf-8', newline='').write(new)
                 patched += 1

@@ -26,7 +26,33 @@
 import os, re, sys
 
 SRC_EXTS = ('.cpp', '.hpp', '.h', '.cc')
-LIT = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
+
+
+def iter_string_literals(text):
+    """扫描 C/C++ 字符串字面量，产出 (start, end, inner)。
+
+    与 apply.py 同一套逻辑：不能用 '"..."' 正则在含 `("hash"_J, "Label")`
+    的代码上错配引号对 —— 那会让部分中文串的字形漏收集，运行时显示成方块。
+    """
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != '"':
+            i += 1
+            continue
+        j = i + 1
+        while j < n:
+            c = text[j]
+            if c == '\\':
+                j += 2
+                continue
+            if c == '"' or c == '\n':
+                break
+            j += 1
+        if j < n and text[j] == '"':
+            yield i, j + 1, text[i + 1:j]
+            i = j + 1
+        else:
+            i += 1
 
 # 兜底区间：源码里没出现、但运行时可能用到的符号
 BASE_RANGES = [
@@ -42,9 +68,9 @@ END_MARK = '// --- END zh-CN glyph ranges ---'
 OLD_BEGIN = '// --- BEGIN zh-CN localization: merge Simplified Chinese glyph ranges ---'
 OLD_END = '// --- END zh-CN localization ---'
 
-ANCHOR = ('io.Fonts->AddFontFromFileTTF((std::filesystem::path(std::getenv("SYSTEMROOT")) '
-          '/ "Fonts" / "meiryo.ttc").string().c_str(), size, &FontCfg, '
-          'io.Fonts->GetGlyphRangesJapanese());')
+# 锚点正则：定位菜单里合并日文字形的那次 AddFontFromFileTTF 调用。
+# 用正则而非精确串，源码/汉化脚本的细微变动不会导致补丁静默跳过。
+ANCHOR_RX = re.compile(r'io\.Fonts->AddFontFromFileTTF\(\([^\n]*meiryo[^\n]*GetGlyphRangesJapanese\(\)\);')
 
 
 def collect_literal_points(inner, points):
@@ -114,8 +140,8 @@ def collect_points_from_tree(src_root):
             except (UnicodeDecodeError, OSError):
                 continue
             files += 1
-            for m in LIT.finditer(text):
-                collect_literal_points(m.group(1), points)
+            for _s, _e, inner in iter_string_literals(text):
+                collect_literal_points(inner, points)
     return points, files
 
 
@@ -211,11 +237,12 @@ def main():
         return 0
 
     text = strip_old_patches(text)
-    if ANCHOR not in text:
+    m = ANCHOR_RX.search(text)
+    if not m:
         print('WARNING: anchor line not found, font patch skipped.', file=sys.stderr)
-        return 0
+        return 2
 
-    text = text.replace(ANCHOR, snippet + '\n\t\t' + ANCHOR, 1)
+    text = text[:m.start()] + snippet + '\n\t\t' + text[m.start():]
     open(menu_cpp, 'w', encoding='utf-8', newline='').write(text)
     print('  font patch     : applied (%d range pairs)' % len(merged))
     return 0
